@@ -1,0 +1,47 @@
+version: '3.9'
+
+services:
+  frontend:
+    build: ./frontend
+    ports:
+      - "3000:3000"
+    depends_on:
+      - backend
+    environment:
+      - VITE_API_URL=http://localhost:8000
+
+  backend:
+    build: ./backend
+    ports:
+      - "8000:8000"
+    depends_on:
+      - redis
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+      - OLLAMA_URL=http://host.docker.internal:11434
+      - OLLAMA_MODEL=sorc/qwen3.5-claude-4.6-opus
+      - DATABASE_URL=sqlite:///./topicLens.db
+      - SERPSHOT_API_KEY=5bff7fc157df396b31466b9f0951a485
+      - DISPLAY=:99
+    volumes:
+      - ./backend:/app
+
+  worker:
+    build: ./backend
+    command: bash -c "Xvfb :99 -screen 0 1920x1080x24 -nolisten tcp & sleep 2 && celery -A tasks worker --loglevel=info --concurrency=4"
+    depends_on:
+      - redis
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+      - OLLAMA_URL=http://host.docker.internal:11434
+      - OLLAMA_MODEL=sorc/qwen3.5-claude-4.6-opus
+      - DATABASE_URL=sqlite:///./topicLens.db
+      - SERPSHOT_API_KEY=5bff7fc157df396b31466b9f0951a485
+      - DISPLAY=:99
+    volumes:
+      - ./backend:/app
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
