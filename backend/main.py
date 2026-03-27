@@ -263,55 +263,102 @@ async def get_status(job_id: str):
     Get the status of a search job.
     Returns progress updates or final results.
     """
-    # First check Celery task status
-    task_result = AsyncResult(job_id, app=celery_app)
+    # Check if Celery is available
+    if CELERY_AVAILABLE and AsyncResult and celery_app:
+        # Use Celery to check task status
+        task_result = AsyncResult(job_id, app=celery_app)
 
-    if task_result.state == "PENDING":
-        # Check if job exists in database
-        db_job = get_job(job_id)
-        if db_job:
+        if task_result.state == "PENDING":
+            # Check if job exists in database
+            db_job = get_job(job_id)
+            if db_job:
+                return {
+                    "id": job_id,
+                    "status": db_job["status"],
+                    "step": "Queued...",
+                    "progress": 0
+                }
+            raise HTTPException(status_code=404, detail="Job not found")
+
+        elif task_result.state == "PROGRESS":
+            meta = task_result.info or {}
             return {
                 "id": job_id,
-                "status": db_job["status"],
-                "step": "Queued...",
-                "progress": 0
+                "status": "progress",
+                "step": meta.get("step", "Processing..."),
+                "progress": meta.get("progress", 0)
             }
-        raise HTTPException(status_code=404, detail="Job not found")
 
-    elif task_result.state == "PROGRESS":
-        meta = task_result.info or {}
-        return {
-            "id": job_id,
-            "status": "progress",
-            "step": meta.get("step", "Processing..."),
-            "progress": meta.get("progress", 0)
-        }
+        elif task_result.state == "SUCCESS":
+            result = task_result.result
+            return {
+                "id": job_id,
+                "status": "done",
+                "topic": result.get("topic", ""),
+                "insights": result.get("insights", {}),
+                "results": result.get("results", {}),
+                "total_results": result.get("total_results", 0),
+                "counts": result.get("counts", {}),
+                "content_analysis_enabled": result.get("content_analysis_enabled", False)
+            }
 
-    elif task_result.state == "SUCCESS":
-        result = task_result.result
-        return {
-            "id": job_id,
-            "status": "done",
-            "topic": result.get("topic", ""),
-            "insights": result.get("insights", {}),
-            "results": result.get("results", {}),
-            "total_results": result.get("total_results", 0),
-            "counts": result.get("counts", {})
-        }
+        elif task_result.state == "FAILURE":
+            return {
+                "id": job_id,
+                "status": "error",
+                "error": str(task_result.info)
+            }
 
-    elif task_result.state == "FAILURE":
-        return {
-            "id": job_id,
-            "status": "error",
-            "error": str(task_result.info)
-        }
+        else:
+            return {
+                "id": job_id,
+                "status": task_result.state.lower(),
+                "step": "Processing..."
+            }
 
     else:
-        return {
-            "id": job_id,
-            "status": task_result.state.lower(),
-            "step": "Processing..."
-        }
+        # Fallback: Check database job status directly
+        db_job = get_job(job_id)
+        if db_job:
+            # Map database status to API status
+            if db_job["status"] == "pending":
+                return {
+                    "id": job_id,
+                    "status": "progress",
+                    "step": "Starting...",
+                    "progress": 0
+                }
+            elif db_job["status"] in ["completed", "done"]:
+                results = db_job["results"] or {}
+                return {
+                    "id": job_id,
+                    "status": "done",
+                    "topic": results.get("topic", ""),
+                    "insights": results.get("insights", {}),
+                    "results": results.get("results", {}),
+                    "total_results": results.get("total_results", 0),
+                    "counts": results.get("counts", {}),
+                    "content_analysis_enabled": results.get("content_analysis_enabled", False),
+                    "analysis_error": results.get("analysis_error"),
+                    "error_details": results.get("error_details")
+                }
+            elif db_job["status"] == "error":
+                results = db_job["results"] or {}
+                return {
+                    "id": job_id,
+                    "status": "error",
+                    "error": results.get("error", "Unknown error"),
+                    "error_details": results.get("error_details")
+                }
+            else:
+                return {
+                    "id": job_id,
+                    "status": "progress",
+                    "step": f"Status: {db_job['status']}",
+                    "progress": 50
+                }
+        else:
+            raise HTTPException(status_code=404, detail="Job not found")
 
 
 @app.get("/api/history")
@@ -429,10 +476,15 @@ async def start_analysis(request: AnalyzeRequest):
 
     topic = request.topic.strip()
     job_id = str(uuid.uuid4())
+    urls_per_source = request.urls_per_source or 4
 
-    # Count URLs to be analyzed
+    # Count total URLs available
     total_urls = sum(len(items) for items in request.results.values() if isinstance(items, list))
+    num_sources = sum(1 for k, v in request.results.items() if isinstance(v, list) and k != "top_10_overall")
+    estimated_analysis_urls = num_sources * urls_per_source
+
     print(f"[API] Starting analysis for '{topic}' with {total_urls} URLs (job: {job_id})")
+    print(f"[API] Will analyze up to {urls_per_source} URLs per source (~{estimated_analysis_urls} URLs total)")
 
     # Create job in database
     create_job(job_id, f"Analysis: {topic}")
@@ -448,6 +500,7 @@ async def start_analysis(request: AnalyzeRequest):
             # Dispatch analysis task with validated data
             analyze_content_task.apply_async(
                 args=[job_id, request.results, topic],
+                kwargs={'urls_per_source': urls_per_source},
                 task_id=job_id
             )
             print(f"[API] Analysis dispatched to Celery queue (job: {job_id})")
@@ -470,7 +523,8 @@ async def start_analysis(request: AnalyzeRequest):
                         results=request.results,
                         topic=topic,
                         job_id=job_id,
-                        max_urls=50  # Default limit
+                        max_urls=50,  # Legacy parameter
+                        urls_per_source=urls_per_source
                     )
 
                     # Process results like the Celery task would
@@ -547,8 +601,8 @@ async def start_analysis(request: AnalyzeRequest):
         return AnalyzeResponse(
             job_id=job_id,
             status="pending",
-            urls_to_analyze=total_urls,
-            estimated_duration_minutes=max(1, total_urls // 10)  # Rough estimate
+            urls_to_analyze=estimated_analysis_urls,
+            estimated_duration_minutes=max(1, estimated_analysis_urls // 8)  # ~8 URLs per minute
         )
 
     except ImportError:

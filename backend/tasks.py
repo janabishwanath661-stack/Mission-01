@@ -1,4 +1,11 @@
-from celery import Celery
+# Try to import Celery (optional for development)
+try:
+    from celery import Celery
+    CELERY_AVAILABLE = True
+except ImportError:
+    CELERY_AVAILABLE = False
+    Celery = None
+
 import os
 import sys
 import json
@@ -21,8 +28,12 @@ from llm import generate_search_queries, generate_deep_insights, rank_content, c
 from database import save_results
 import google_api
 
-REDIS_URL = os.getenv("REDIS_URL", "redis://redis:6379/0")
-celery_app = Celery("tasks", broker=REDIS_URL, backend=REDIS_URL)
+# Celery configuration (only if available)
+if CELERY_AVAILABLE:
+    REDIS_URL = os.getenv("REDIS_URL", "redis://redis:6379/0")
+    celery_app = Celery("tasks", broker=REDIS_URL, backend=REDIS_URL)
+else:
+    celery_app = None
 
 # Directory to store scraped data
 SCRAPED_DATA_DIR = os.path.join(os.path.dirname(__file__), "scraped_data")
@@ -59,9 +70,68 @@ def save_scraped_data_to_file(job_id: str, topic: str, data: dict):
         return None
 
 
+def save_individual_url_data(url_data: dict, source: str, job_id: str, url_index: int):
+    """
+    Save individual URL data to its own JSON file.
+
+    Args:
+        url_data: The data for a single URL
+        source: The source/platform name (e.g., 'youtube', 'reddit')
+        job_id: Unique job identifier
+        url_index: Index of this URL in the source results
+
+    Returns:
+        Path to the saved file
+    """
+    try:
+        # Create job-specific directory
+        job_dir = os.path.join(SCRAPED_DATA_DIR, f"job_{job_id[:8]}")
+        os.makedirs(job_dir, exist_ok=True)
+
+        # Create source-specific subdirectory
+        source_dir = os.path.join(job_dir, source)
+        os.makedirs(source_dir, exist_ok=True)
+
+        # Generate safe filename from URL or title
+        if url_data.get('title'):
+            # Use title for filename
+            safe_title = "".join(c if c.isalnum() or c in (' ', '-', '_') else '_'
+                               for c in url_data['title'])
+            safe_title = safe_title.replace(' ', '_')[:50]  # Limit length
+            filename = f"{url_index:03d}_{safe_title}.json"
+        else:
+            # Fall back to index-based naming
+            filename = f"{url_index:03d}_url.json"
+
+        filepath = os.path.join(source_dir, filename)
+
+        # Add metadata
+        enriched_data = {
+            "metadata": {
+                "job_id": job_id,
+                "source": source,
+                "url_index": url_index,
+                "saved_at": datetime.now().isoformat(),
+                "file_path": filepath
+            },
+            "data": url_data
+        }
+
+        # Save to file
+        with open(filepath, 'w', encoding='utf-8') as f:
+            json.dump(enriched_data, f, indent=2, ensure_ascii=False)
+
+        return filepath
+
+    except Exception as e:
+        print(f"[URL Save Error] Could not save URL {url_index} from {source}: {e}")
+        return None
+
+
 def save_individual_scraper_results(source: str, data: list, job_id: str):
     """
     Save individual scraper results to a separate file.
+    Also saves each URL to its own individual file.
 
     Args:
         source: The source/platform name (e.g., 'youtube', 'reddit')
@@ -83,17 +153,28 @@ def save_individual_scraper_results(source: str, data: list, job_id: str):
             "data": data
         }
 
+        # Save aggregated source file
         with open(filepath, 'w', encoding='utf-8') as f:
             json.dump(save_data, f, indent=2, ensure_ascii=False)
 
         print(f"[Individual Save] {source} data saved to: {filepath}")
+
+        # Save each URL individually
+        saved_urls = 0
+        for idx, url_data in enumerate(data):
+            url_file = save_individual_url_data(url_data, source, job_id, idx)
+            if url_file:
+                saved_urls += 1
+
+        print(f"[URL Files] Saved {saved_urls}/{len(data)} individual URL files for {source}")
+
         return filepath
     except Exception as e:
         print(f"[Individual Save Error] Could not save {source} data: {e}")
         return None
 
 
-def analyze_urls_content(results: dict, topic: str, job_id: str, max_urls: int = 50) -> dict:
+def analyze_urls_content(results: dict, topic: str, job_id: str, max_urls: int = 50, urls_per_source: int = 4) -> dict:
     """
     Analyze URLs content using the Content Analysis Agent.
 
@@ -101,12 +182,14 @@ def analyze_urls_content(results: dict, topic: str, job_id: str, max_urls: int =
         results: Ranked results from scraping
         topic: Search topic
         job_id: Unique job identifier
-        max_urls: Maximum URLs to analyze
+        max_urls: Maximum TOTAL URLs to analyze (legacy parameter)
+        urls_per_source: Maximum URLs to analyze per source/platform (default: 4)
 
     Returns:
         Enriched results with analyzed content or error info
     """
     print(f"[Content Analysis] Starting analysis for job {job_id}")
+    print(f"[Content Analysis] Will analyze up to {urls_per_source} URLs per source")
 
     # Check Ollama health before starting analysis
     try:
@@ -159,7 +242,11 @@ def analyze_urls_content(results: dict, topic: str, job_id: str, max_urls: int =
 
         # Initialize agent and run analysis using proper method
         agent = ContentAnalysisAgent()
-        enriched_data = agent.analyze_scraped_data(temp_filepath, max_urls=max_urls)
+        enriched_data = agent.analyze_scraped_data(
+            temp_filepath,
+            max_urls=max_urls,
+            urls_per_source=urls_per_source
+        )
 
         # Clean up temporary file
         try:
@@ -194,8 +281,33 @@ def analyze_urls_content(results: dict, topic: str, job_id: str, max_urls: int =
         }
 
 
-@celery_app.task(bind=True, name="analyze_content")
-def analyze_content_task(self, job_id: str, results: dict, topic: str, max_urls: int = 50):
+# Helper function to make task decorators optional
+def celery_task_decorator(*args, **kwargs):
+    """Decorator that works with or without Celery."""
+    def decorator(func):
+        if CELERY_AVAILABLE and celery_app:
+            # Use actual Celery decorator
+            return celery_app.task(*args, **kwargs)(func)
+        else:
+            # No Celery - just return the function unchanged but add apply_async method
+            def apply_async(args_list=None, task_id=None, **kwargs):
+                # Mock apply_async - just return a mock result
+                return MockAsyncResult()
+            func.apply_async = apply_async
+            return func
+    return decorator
+
+class MockAsyncResult:
+    """Mock AsyncResult for when Celery is not available."""
+    def __init__(self):
+        self.state = "PENDING"
+
+    def ready(self):
+        return False
+
+
+@celery_task_decorator(bind=True, name="analyze_content")
+def analyze_content_task(self, job_id: str, results: dict, topic: str, max_urls: int = 50, urls_per_source: int = 4):
     """
     Separate task to analyze content from existing search results.
 
@@ -203,33 +315,39 @@ def analyze_content_task(self, job_id: str, results: dict, topic: str, max_urls:
         job_id: Search job ID
         results: Existing search results
         topic: Search topic
-        max_urls: Maximum URLs to analyze (default: 50)
+        max_urls: Maximum TOTAL URLs to analyze (legacy, now uses urls_per_source)
+        urls_per_source: Maximum URLs to analyze per source (default: 4)
     """
     try:
+        # Count sources
+        num_sources = sum(1 for k, v in results.items() if isinstance(v, list) and k != "top_10_overall")
+        estimated_urls = num_sources * urls_per_source
+
         # Update task state with startup info
         self.update_state(
             state="PROGRESS",
             meta={
                 "step": "Initializing content analysis...",
                 "progress": 5,
-                "details": f"Preparing to analyze up to {max_urls} URLs"
+                "details": f"Will analyze up to {urls_per_source} URLs per source (~{estimated_urls} total)"
             }
         )
 
         print(f"[Content Analysis Task] Starting analysis for job {job_id}")
         print(f"[Content Analysis Task] Topic: {topic}")
-        print(f"[Content Analysis Task] Max URLs: {max_urls}")
+        print(f"[Content Analysis Task] URLs per source: {urls_per_source}")
 
         # Check total URLs available
         total_urls = sum(len(items) for items in results.values() if isinstance(items, list))
         print(f"[Content Analysis Task] Total URLs available: {total_urls}")
+        print(f"[Content Analysis Task] Will analyze ~{estimated_urls} URLs (top {urls_per_source} from each source)")
 
         self.update_state(
             state="PROGRESS",
             meta={
-                "step": f"Found {total_urls} URLs to analyze...",
+                "step": f"Analyzing top {urls_per_source} URLs from each source...",
                 "progress": 10,
-                "details": "Running health checks and starting analysis"
+                "details": f"Processing {num_sources} sources (~{estimated_urls} URLs total)"
             }
         )
 
@@ -238,10 +356,11 @@ def analyze_content_task(self, job_id: str, results: dict, topic: str, max_urls:
             results,
             topic,
             job_id,
-            max_urls=max_urls
+            max_urls=max_urls,
+            urls_per_source=urls_per_source
         )
 
-        # Check if analysis returned an error
+        # Check if analysis returned an error        # Check if analysis returned an error
         if isinstance(analysis_result, dict) and "error" in analysis_result:
             print(f"[Content Analysis Task Error] {analysis_result['error']}")
 
@@ -304,6 +423,15 @@ def analyze_content_task(self, job_id: str, results: dict, topic: str, max_urls:
             "analysis_timestamp": datetime.utcnow().isoformat()
         }
 
+        # Save individual URL files with analyzed content
+        print(f"[URL Save] Saving individual analyzed URL files for job {job_id}")
+        total_analyzed_urls_saved = 0
+        for source, data in analysis_result.items():
+            if source != "top_10_overall" and isinstance(data, list) and len(data) > 0:
+                save_individual_scraper_results(source, data, f"{job_id}_ANALYZED")
+                total_analyzed_urls_saved += len(data)
+        print(f"[URL Save] Completed: {total_analyzed_urls_saved} analyzed URL files saved")
+
         # Save analyzed data to file
         save_scraped_data_to_file(job_id, f"{topic}_ANALYZED", final_data)
 
@@ -346,19 +474,20 @@ AVAILABLE_SOURCES = [
     "linkedin", "facebook", "instagram", "quora", "events"
 ]
 
-# Celery configuration
-celery_app.conf.update(
-    task_serializer="json",
-    accept_content=["json"],
-    result_serializer="json",
-    timezone="UTC",
-    enable_utc=True,
-    task_track_started=True,
-    result_extended=True,
-)
+# Celery configuration (only if Celery is available)
+if CELERY_AVAILABLE and celery_app:
+    celery_app.conf.update(
+        task_serializer="json",
+        accept_content=["json"],
+        result_serializer="json",
+        timezone="UTC",
+        enable_utc=True,
+        task_track_started=True,
+        result_extended=True,
+    )
 
 
-@celery_app.task(bind=True, name="scrape_topic")
+@celery_task_decorator(bind=True, name="scrape_topic")
 def scrape_topic_task(self, topic: str, job_id: str, search_mode: str = "scraping", sources: list = None):
     """
     Main task that orchestrates all scraping/API and LLM operations.
@@ -483,6 +612,19 @@ def scrape_topic_task(self, topic: str, job_id: str, search_mode: str = "scrapin
             meta={"step": "Ranking content using LLM...", "progress": 85}
         )
         ranked_results = rank_content(topic, results)
+
+        # Step 6.5: Save individual URL files for each source
+        self.update_state(
+            state="PROGRESS",
+            meta={"step": "Saving individual URL files...", "progress": 90}
+        )
+        print(f"[URL Save] Saving individual URL files for job {job_id}")
+        total_urls_saved = 0
+        for source, data in ranked_results.items():
+            if source != "top_10_overall" and isinstance(data, list) and len(data) > 0:
+                save_individual_scraper_results(source, data, job_id)
+                total_urls_saved += len(data)
+        print(f"[URL Save] Completed: {total_urls_saved} individual URL files saved")
 
         # Step 7: Generate deep insights using LLM
         self.update_state(

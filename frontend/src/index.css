@@ -805,9 +805,8 @@ body {
 
 .analysis-prompt {
   display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 24px;
+  flex-direction: column;
+  gap: 20px;
   padding: 24px;
   background: linear-gradient(135deg, #f8faff 0%, #e6f0ff 100%);
   border: 2px solid #6366f1;
@@ -843,6 +842,53 @@ body {
   max-width: 500px;
 }
 
+.analysis-config {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 16px;
+  background: rgba(255, 255, 255, 0.7);
+  border-radius: 12px;
+  border: 1px solid rgba(99, 102, 241, 0.2);
+}
+
+.config-label {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  font-size: 14px;
+  font-weight: 500;
+  color: #374151;
+}
+
+.urls-selector {
+  padding: 8px 12px;
+  border: 2px solid #e5e7eb;
+  border-radius: 8px;
+  font-size: 14px;
+  background: white;
+  cursor: pointer;
+  transition: border-color 0.2s ease;
+  min-width: 200px;
+}
+
+.urls-selector:focus {
+  outline: none;
+  border-color: #6366f1;
+  box-shadow: 0 0 0 3px rgba(99, 102, 241, 0.1);
+}
+
+.config-info {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.config-info small {
+  color: #6b7280;
+  font-size: 12px;
+}
+
 .deep-analysis-button {
   background: linear-gradient(135deg, #6366f1 0%, #8b5cf6 100%);
   color: white;
@@ -855,7 +901,7 @@ body {
   transition: all 0.3s ease;
   box-shadow: 0 4px 12px rgba(99, 102, 241, 0.3);
   white-space: nowrap;
-  flex-shrink: 0;
+  align-self: flex-start;
 }
 
 .deep-analysis-button:hover:not(:disabled) {
@@ -919,6 +965,17 @@ body {
 
   .analysis-info h3 {
     font-size: 18px;
+  }
+
+  .config-label {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 8px;
+  }
+
+  .urls-selector {
+    width: 100%;
+    min-width: auto;
   }
 }
 

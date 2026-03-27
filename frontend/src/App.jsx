@@ -14,6 +14,7 @@ export default function App() {
   const [analysisStatus, setAnalysisStatus] = useState('idle') // idle, analyzing, done, error
   const [analysisConfig, setAnalysisConfig] = useState(null) // Analysis capabilities info
   const [detailedError, setDetailedError] = useState(null) // Enhanced error information
+  const [urlsPerSource, setUrlsPerSource] = useState(4) // Number of URLs to analyze per source
   const pollIntervalRef = useRef(null)
 
   // Fetch analysis capabilities on component mount
@@ -124,7 +125,8 @@ export default function App() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           topic: data.topic,
-          results: data.results
+          results: data.results,
+          urls_per_source: urlsPerSource
         }),
       })
 
@@ -381,6 +383,27 @@ export default function App() {
                     <p>AI can visit each webpage, extract full content, and provide detailed analysis including relevance scores, quality ratings, and actionable insights.</p>
                   </div>
                 </div>
+
+                <div className="analysis-config">
+                  <label className="config-label">
+                    URLs per source:
+                    <select
+                      value={urlsPerSource}
+                      onChange={(e) => setUrlsPerSource(parseInt(e.target.value))}
+                      className="urls-selector"
+                    >
+                      <option value={2}>2 URLs (Fast - ~1 min)</option>
+                      <option value={3}>3 URLs (Quick - ~2 min)</option>
+                      <option value={4}>4 URLs (Balanced - ~3 min)</option>
+                      <option value={5}>5 URLs (Thorough - ~4 min)</option>
+                      <option value={8}>8 URLs (Comprehensive - ~6 min)</option>
+                    </select>
+                  </label>
+                  <div className="config-info">
+                    <small>📊 Analyzes top {urlsPerSource} URLs from each source (~{Math.max(1, Object.keys(data?.results || {}).length - 1) * urlsPerSource} total)</small>
+                  </div>
+                </div>
+
                 <button
                   className="deep-analysis-button"
                   onClick={handleDeepAnalysis}

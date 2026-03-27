@@ -17,6 +17,7 @@ class SearchResponse(BaseModel):
 class AnalyzeRequest(BaseModel):
     topic: str
     results: Dict[str, Any]  # The results to analyze
+    urls_per_source: Optional[int] = 4  # Max URLs to analyze per source (default: 4)
 
 
 class AnalyzeResponse(BaseModel):
