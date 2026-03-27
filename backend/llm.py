@@ -1,44 +1,109 @@
-import httpx
 import json
 import os
 import re
 import time
+import threading
 from typing import Dict, Optional
 
-# Updated default configuration based on diagnostic results
-OLLAMA_URL = os.getenv("OLLAMA_URL", "http://127.0.0.1:11434")
-OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.2:latest")
+# Hugging Face configuration
+HF_MODEL_ID = os.getenv("HF_MODEL_ID", "microsoft/phi-2")
+HF_DEVICE = os.getenv("HF_DEVICE", "auto")  # "auto", "cpu", "cuda", "cuda:0", etc.
+HF_MAX_NEW_TOKENS = int(os.getenv("HF_MAX_NEW_TOKENS", "512"))
 
-# Fallback URLs to try if primary fails
-FALLBACK_URLS = [
-    "http://127.0.0.1:11434",
-    "http://localhost:11434",
-    "http://host.docker.internal:11434"
-]
+# Global model instance (lazy loaded)
+_model = None
+_tokenizer = None
+_model_lock = threading.Lock()
+_model_loaded = False
+_model_error = None
 
 
-def check_ollama_health(url: str = None, model: str = None) -> Dict:
+def _load_model():
+    """Load the Hugging Face model lazily on first use."""
+    global _model, _tokenizer, _model_loaded, _model_error
+
+    with _model_lock:
+        if _model_loaded:
+            return _model is not None
+
+        try:
+            print(f"[HuggingFace] Loading model: {HF_MODEL_ID}")
+            print(f"[HuggingFace] Device: {HF_DEVICE}")
+
+            from transformers import AutoModelForCausalLM, AutoTokenizer
+            import torch
+
+            # Determine device
+            if HF_DEVICE == "auto":
+                device = "cuda" if torch.cuda.is_available() else "cpu"
+            else:
+                device = HF_DEVICE
+
+            print(f"[HuggingFace] Using device: {device}")
+
+            # Load tokenizer
+            _tokenizer = AutoTokenizer.from_pretrained(
+                HF_MODEL_ID,
+                trust_remote_code=True
+            )
+
+            # Set pad token if not set
+            if _tokenizer.pad_token is None:
+                _tokenizer.pad_token = _tokenizer.eos_token
+
+            # Load model with appropriate settings
+            load_kwargs = {
+                "trust_remote_code": True,
+                "low_cpu_mem_usage": True,
+            }
+
+            if device == "cuda":
+                load_kwargs["dtype"] = torch.float16
+                load_kwargs["device_map"] = "auto"
+            else:
+                load_kwargs["dtype"] = torch.float32
+
+            _model = AutoModelForCausalLM.from_pretrained(
+                HF_MODEL_ID,
+                **load_kwargs
+            )
+
+            if device == "cpu":
+                _model = _model.to(device)
+
+            _model.eval()
+            _model_loaded = True
+            _model_error = None
+
+            print(f"[HuggingFace] Model loaded successfully!")
+            return True
+
+        except Exception as e:
+            _model_error = str(e)
+            _model_loaded = True  # Mark as loaded to prevent retry loops
+            print(f"[HuggingFace] Failed to load model: {e}")
+            return False
+
+
+def check_model_health(model_id: str = None) -> Dict:
     """
-    Check if Ollama server is accessible and model is available.
+    Check if the Hugging Face model is loaded and ready.
 
     Returns:
         {
             "healthy": bool,
-            "url": str,
             "model": str,
-            "models_available": list,
+            "device": str,
             "error": str or None,
             "response_time": float
         }
     """
-    url = url or OLLAMA_URL
-    model = model or OLLAMA_MODEL
+    model_id = model_id or HF_MODEL_ID
 
     result = {
         "healthy": False,
-        "url": url,
-        "model": model,
-        "models_available": [],
+        "model": model_id,
+        "device": HF_DEVICE,
         "error": None,
         "response_time": None
     }
@@ -46,168 +111,130 @@ def check_ollama_health(url: str = None, model: str = None) -> Dict:
     try:
         start_time = time.time()
 
-        # Check server availability
-        response = httpx.get(f"{url}/api/tags", timeout=10.0)
+        # Try to load model if not loaded
+        if not _model_loaded:
+            success = _load_model()
+            if not success:
+                result["error"] = _model_error or "Failed to load model"
+                return result
+
+        if _model is None:
+            result["error"] = _model_error or "Model not loaded"
+            return result
+
+        # Test with a simple generation
+        test_response = call_llm("Say OK", temperature=0.1, max_tokens=10)
         result["response_time"] = round(time.time() - start_time, 2)
 
-        if response.status_code == 200:
-            data = response.json()
-            models = data.get("models", [])
-            result["models_available"] = [m.get("name", "") for m in models]
-
-            # Check if target model is available
-            if model in result["models_available"]:
-                # Test model with simple generation
-                test_result = httpx.post(
-                    f"{url}/api/generate",
-                    json={
-                        "model": model,
-                        "prompt": "Reply: OK",
-                        "stream": False,
-                        "options": {"temperature": 0.1, "num_ctx": 512}
-                    },
-                    timeout=30.0
-                )
-
-                if test_result.status_code == 200:
-                    result["healthy"] = True
-                else:
-                    result["error"] = f"Model test failed with status {test_result.status_code}"
+        if test_response:
+            result["healthy"] = True
+            # Get actual device
+            import torch
+            if hasattr(_model, 'device'):
+                result["device"] = str(_model.device)
+            elif torch.cuda.is_available() and next(_model.parameters()).is_cuda:
+                result["device"] = "cuda"
             else:
-                result["error"] = f"Model '{model}' not available. Available: {', '.join(result['models_available'])}"
+                result["device"] = "cpu"
         else:
-            result["error"] = f"Server returned status {response.status_code}"
+            result["error"] = "Model test generation failed"
 
-    except httpx.ConnectError:
-        result["error"] = "Connection refused - Ollama server not running"
-    except httpx.TimeoutException:
-        result["error"] = "Connection timeout"
     except Exception as e:
         result["error"] = str(e)
 
     return result
 
 
-def find_working_ollama_config() -> Optional[Dict]:
+# Backward compatibility alias
+def check_ollama_health(url: str = None, model: str = None) -> Dict:
+    """Backward compatible alias for check_model_health."""
+    health = check_model_health(model)
+    # Add url field for backward compatibility
+    health["url"] = "local"
+    health["models_available"] = [HF_MODEL_ID]
+    return health
+
+
+def call_llm(prompt: str, temperature: float = 0.3, max_tokens: int = None, max_retries: int = 2) -> str:
     """
-    Find a working Ollama configuration by trying multiple URLs and models.
-
-    Returns:
-        {
-            "url": str,
-            "model": str,
-            "response_time": float
-        } or None if no working config found
-    """
-    # Try primary config first
-    health = check_ollama_health()
-    if health["healthy"]:
-        return {
-            "url": health["url"],
-            "model": health["model"],
-            "response_time": health["response_time"]
-        }
-
-    print(f"[Ollama] Primary config failed: {health['error']}")
-
-    # Try fallback URLs
-    for url in FALLBACK_URLS:
-        if url == OLLAMA_URL:
-            continue  # Already tried
-
-        print(f"[Ollama] Trying fallback URL: {url}")
-        health = check_ollama_health(url=url)
-
-        if health["healthy"]:
-            print(f"[Ollama] Found working config: {url} with {health['model']}")
-            return {
-                "url": url,
-                "model": health["model"],
-                "response_time": health["response_time"]
-            }
-
-        # If primary model not available, try common models
-        if health["models_available"]:
-            common_models = ["llama3.2:latest", "llama3.1:latest", "llama3:latest", "qwen2.5:0.5b"]
-            for model in common_models:
-                if model in health["models_available"]:
-                    print(f"[Ollama] Trying model: {model}")
-                    health = check_ollama_health(url=url, model=model)
-                    if health["healthy"]:
-                        print(f"[Ollama] Found working config: {url} with {model}")
-                        return {
-                            "url": url,
-                            "model": model,
-                            "response_time": health["response_time"]
-                        }
-
-    return None
-
-
-def call_ollama(prompt: str, temperature: float = 0.3, max_retries: int = 2) -> str:
-    """
-    Call the local Ollama instance with retry logic and better error handling.
+    Call the local Hugging Face model for text generation.
 
     Args:
-        prompt: The prompt to send to Ollama
+        prompt: The prompt to send to the model
         temperature: Generation temperature (0.0 to 1.0)
+        max_tokens: Maximum new tokens to generate
         max_retries: Maximum number of retry attempts
 
     Returns:
         Generated text response or empty string on failure
     """
+    max_tokens = max_tokens or HF_MAX_NEW_TOKENS
     last_error = None
+
+    # Ensure model is loaded
+    if not _model_loaded:
+        if not _load_model():
+            print(f"[HuggingFace] Model not loaded: {_model_error}")
+            return ""
+
+    if _model is None or _tokenizer is None:
+        print(f"[HuggingFace] Model not available: {_model_error}")
+        return ""
 
     for attempt in range(max_retries + 1):
         try:
-            # Find working config if this is a retry
-            if attempt > 0:
-                working_config = find_working_ollama_config()
-                if working_config:
-                    url = working_config["url"]
-                    model = working_config["model"]
-                    print(f"[Ollama] Retry {attempt}: Using {url} with {model}")
-                else:
-                    print(f"[Ollama] Retry {attempt}: No working config found")
-                    break
-            else:
-                url = OLLAMA_URL
-                model = OLLAMA_MODEL
+            import torch
 
-            resp = httpx.post(
-                f"{url}/api/generate",
-                json={
-                    "model": model,
-                    "prompt": prompt,
-                    "stream": False,
-                    "options": {"temperature": temperature, "num_ctx": 4096}
-                },
-                timeout=120.0
+            # Tokenize input
+            inputs = _tokenizer(
+                prompt,
+                return_tensors="pt",
+                truncation=True,
+                max_length=2048
             )
 
-            if resp.status_code == 200:
-                response_text = resp.json().get("response", "").strip()
-                if attempt > 0:
-                    print(f"[Ollama] Retry {attempt} successful!")
-                return response_text
-            else:
-                last_error = f"HTTP {resp.status_code}: {resp.text}"
+            # Move to same device as model
+            device = next(_model.parameters()).device
+            inputs = {k: v.to(device) for k, v in inputs.items()}
 
-        except httpx.ConnectError as e:
-            last_error = f"Connection failed: {e}"
-        except httpx.TimeoutException:
-            last_error = "Request timeout"
+            # Generate
+            with torch.no_grad():
+                outputs = _model.generate(
+                    **inputs,
+                    max_new_tokens=max_tokens,
+                    temperature=temperature if temperature > 0 else 0.01,
+                    do_sample=temperature > 0,
+                    pad_token_id=_tokenizer.pad_token_id,
+                    eos_token_id=_tokenizer.eos_token_id,
+                )
+
+            # Decode response (only the new tokens)
+            input_length = inputs["input_ids"].shape[1]
+            response_tokens = outputs[0][input_length:]
+            response_text = _tokenizer.decode(response_tokens, skip_special_tokens=True).strip()
+
+            if attempt > 0:
+                print(f"[HuggingFace] Retry {attempt} successful!")
+
+            return response_text
+
         except Exception as e:
-            last_error = f"Unexpected error: {e}"
+            last_error = f"Generation error: {e}"
 
         if attempt < max_retries:
-            wait_time = 2 ** attempt  # Exponential backoff
-            print(f"[Ollama] Attempt {attempt + 1} failed: {last_error}")
-            print(f"[Ollama] Retrying in {wait_time}s...")
+            wait_time = 2 ** attempt
+            print(f"[HuggingFace] Attempt {attempt + 1} failed: {last_error}")
+            print(f"[HuggingFace] Retrying in {wait_time}s...")
             time.sleep(wait_time)
 
-    print(f"[Ollama Error] All attempts failed. Last error: {last_error}")
+    print(f"[HuggingFace Error] All attempts failed. Last error: {last_error}")
     return ""
+
+
+# Backward compatibility alias
+def call_ollama(prompt: str, temperature: float = 0.3, max_retries: int = 2) -> str:
+    """Backward compatible alias for call_llm."""
+    return call_llm(prompt, temperature, max_retries=max_retries)
 
 
 def generate_search_queries(topic: str) -> dict:
@@ -225,7 +252,7 @@ Return ONLY a valid JSON object:
   "twitter_query": "{topic} expert tweets threads",
   "quora_query": "{topic} questions answers"
 }}"""
-    response = call_ollama(prompt, temperature=0.1)
+    response = call_llm(prompt, temperature=0.1)
     try:
         return json.loads(response[response.find("{"):response.rfind("}") + 1])
     except:
@@ -370,7 +397,7 @@ Return ONLY a JSON array of indices in ranked order (best first). Example: [2, 0
 Return the indices as a simple array, nothing else.
 """
 
-    response = call_ollama(prompt, temperature=0.2)
+    response = call_llm(prompt, temperature=0.2)
 
     try:
         # Extract JSON array from response
@@ -416,7 +443,7 @@ Resources:
 Return ONLY a JSON array of the 10 best indices (best first). Example: [5, 12, 0, 8, 3, 15, 1, 9, 4, 7]
 """
 
-    response = call_ollama(prompt, temperature=0.3)
+    response = call_llm(prompt, temperature=0.3)
 
     try:
         match = re.search(r'\[[\d,\s]+\]', response)
@@ -462,7 +489,7 @@ Return ONLY a valid JSON object with the following structure:
   "action_plan": ["Step 1 to start learning/engaging", "Step 2", "Step 3"]
 }}
 """
-    response = call_ollama(prompt, temperature=0.4)
+    response = call_llm(prompt, temperature=0.4)
     try:
         return json.loads(response[response.find("{"):response.rfind("}") + 1])
     except:

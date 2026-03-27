@@ -7,8 +7,6 @@ services:
       - "3000:3000"
     depends_on:
       - backend
-    environment:
-      - VITE_API_URL=http://localhost:8000
 
   backend:
     build: ./backend
@@ -18,13 +16,23 @@ services:
       - redis
     environment:
       - REDIS_URL=redis://redis:6379/0
-      - OLLAMA_URL=http://host.docker.internal:11434
-      - OLLAMA_MODEL=llama3.2:latest
+      - HF_MODEL_ID=microsoft/phi-2
+      - HF_DEVICE=cuda
+      - HF_MAX_NEW_TOKENS=512
       - DATABASE_URL=sqlite:///./topicLens.db
       - SERPSHOT_API_KEY=5bff7fc157df396b31466b9f0951a485
       - DISPLAY=:99
+      - NVIDIA_VISIBLE_DEVICES=all
     volumes:
       - ./backend:/app
+      - huggingface_cache:/root/.cache/huggingface
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
 
   worker:
     build: ./backend
@@ -33,15 +41,28 @@ services:
       - redis
     environment:
       - REDIS_URL=redis://redis:6379/0
-      - OLLAMA_URL=http://host.docker.internal:11434
-      - OLLAMA_MODEL=llama3.2:latest
+      - HF_MODEL_ID=microsoft/phi-2
+      - HF_DEVICE=cuda
+      - HF_MAX_NEW_TOKENS=512
       - DATABASE_URL=sqlite:///./topicLens.db
       - SERPSHOT_API_KEY=5bff7fc157df396b31466b9f0951a485
       - DISPLAY=:99
+      - NVIDIA_VISIBLE_DEVICES=all
     volumes:
       - ./backend:/app
+      - huggingface_cache:/root/.cache/huggingface
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
 
   redis:
     image: redis:7-alpine
     ports:
       - "6379:6379"
+
+volumes:
+  huggingface_cache:

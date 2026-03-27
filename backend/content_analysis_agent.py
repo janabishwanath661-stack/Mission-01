@@ -2,7 +2,7 @@
 """
 Content Analysis Agent Script
 
-This script uses your local Ollama model as an intelligent agent to:
+This script uses a local Hugging Face model as an intelligent agent to:
 1. Read all scraped data from JSON files
 2. Visit every URL found during scraping
 3. Extract and analyze webpage content using AI
@@ -30,11 +30,10 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 # Import existing utilities and LLM functions
 sys.path.append('backend')
 from scrapers.utils import get_headers, rate_limit, clean_text, safe_request, get_browser_driver
-from llm import call_ollama
+from llm import call_llm, HF_MODEL_ID
 
-# Configuration
-OLLAMA_URL = os.getenv("OLLAMA_URL", "http://host.docker.internal:11434")
-OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.2:latest")
+# Configuration (using Hugging Face model from llm.py)
+LLM_MODEL = HF_MODEL_ID
 
 # Processing settings
 MAX_CONTENT_LENGTH = 8000  # Characters for LLM analysis
@@ -374,20 +373,19 @@ class WebContentExtractor:
         return result
 
 
-class OllamaContentAnalyzer:
-    """Analyze extracted content using local Ollama model."""
+class LLMContentAnalyzer:
+    """Analyze extracted content using local Hugging Face model."""
 
     def __init__(self):
-        self.ollama_url = OLLAMA_URL
-        self.model = OLLAMA_MODEL
+        self.model = LLM_MODEL
 
     def analyze_content(self, content_data: Dict, topic: str) -> Dict:
         """
-        Analyze extracted content using Ollama LLM.
+        Analyze extracted content using local LLM.
 
         Returns comprehensive analysis with all requested fields.
         """
-        print(f"[ANALYZE] Analyzing content with Ollama: {content_data['url'][:50]}...")
+        print(f"[ANALYZE] Analyzing content with LLM: {content_data['url'][:50]}...")
 
         # Prepare content for analysis
         analysis_content = self._prepare_content_for_analysis(content_data)
@@ -399,15 +397,15 @@ class OllamaContentAnalyzer:
         prompt = self._create_analysis_prompt(analysis_content, content_data, topic)
 
         try:
-            # Call Ollama
-            response = call_ollama(prompt, temperature=0.3)
+            # Call LLM
+            response = call_llm(prompt, temperature=0.3)
 
             if not response:
-                print(f"[ERROR] Empty response from Ollama for {content_data['url']}")
+                print(f"[ERROR] Empty response from LLM for {content_data['url']}")
                 return self._generate_fallback_analysis(content_data, topic)
 
             # Parse response
-            analysis = self._parse_ollama_response(response)
+            analysis = self._parse_llm_response(response)
 
             # Add metadata
             analysis["analyzed_at"] = datetime.utcnow().isoformat()
@@ -442,7 +440,7 @@ class OllamaContentAnalyzer:
         return f"{start_part}\n\n[...content truncated...]\n\n{end_part}"
 
     def _create_analysis_prompt(self, content: str, content_data: Dict, topic: str) -> str:
-        """Create comprehensive analysis prompt for Ollama."""
+        """Create comprehensive analysis prompt for the LLM."""
         return f"""You are an expert content analyst. Analyze the following webpage content about "{topic}" and provide a comprehensive JSON analysis.
 
 URL: {content_data.get('url', 'Unknown')}
@@ -495,8 +493,8 @@ Guidelines:
 
 Return ONLY the valid JSON object, no other text."""
 
-    def _parse_ollama_response(self, response: str) -> Dict:
-        """Parse JSON response from Ollama."""
+    def _parse_llm_response(self, response: str) -> Dict:
+        """Parse JSON response from LLM."""
         try:
             # Extract JSON from response
             json_start = response.find('{')
@@ -619,7 +617,7 @@ class ContentAnalysisAgent:
 
     def __init__(self):
         self.extractor = WebContentExtractor()
-        self.analyzer = OllamaContentAnalyzer()
+        self.analyzer = LLMContentAnalyzer()
         self.stats = {
             "total_urls": 0,
             "successful_extractions": 0,
@@ -689,7 +687,7 @@ class ContentAnalysisAgent:
             print(f"[LIMIT] Limiting analysis to {max_urls} URLs (from {len(all_urls)} total)")
             all_urls = all_urls[:max_urls]
 
-        print(f"[TARGET] Analyzing {len(all_urls)} URLs with local Ollama model...")
+        print(f"[TARGET] Analyzing {len(all_urls)} URLs with local HuggingFace model...")
 
         # Process URLs with controlled parallelism
         enriched_results = {}
@@ -755,7 +753,7 @@ class ContentAnalysisAgent:
             "analysis_duration_seconds": round(duration, 2),
             "avg_time_per_url": round(duration / len(all_urls), 2) if all_urls else 0,
             "analyzed_at": self.stats["end_time"].isoformat(),
-            "ollama_model": self.analyzer.model
+            "llm_model": self.analyzer.model
         }
 
         # Print statistics
@@ -928,7 +926,7 @@ class ContentAnalysisAgent:
 
 def main():
     """Main function."""
-    print("[ANALYZE] Content Analysis Agent - Powered by Local Ollama")
+    print("[ANALYZE] Content Analysis Agent - Powered by Local HuggingFace")
     print("=" * 60)
 
     # Get input file
@@ -964,18 +962,17 @@ def main():
     except ValueError:
         max_urls = None
 
-    print(f"\n[START] Starting analysis with Ollama model: {OLLAMA_MODEL}")
-    print(f"[NETWORK] Ollama URL: {OLLAMA_URL}")
+    print(f"\n[START] Starting analysis with HuggingFace model: {LLM_MODEL}")
 
-    # Test Ollama connection
+    # Test LLM connection
     try:
-        test_response = call_ollama("Test connection. Reply with: OK", temperature=0.1)
+        test_response = call_llm("Test connection. Reply with: OK", temperature=0.1)
         if "OK" in test_response or test_response:
-            print("[OK] Ollama connection successful")
+            print("[OK] LLM connection successful")
         else:
-            print("[WARN] Ollama connection test unclear - proceeding anyway")
+            print("[WARN] LLM connection test unclear - proceeding anyway")
     except Exception as e:
-        print(f"[WARN] Ollama connection test failed: {e}")
+        print(f"[WARN] LLM connection test failed: {e}")
         proceed = input("Continue anyway? (y/N): ").strip().lower()
         if proceed != 'y':
             return

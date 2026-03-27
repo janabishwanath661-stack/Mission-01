@@ -71,22 +71,21 @@ async def get_config():
         "available": False,
         "status": "unknown",
         "error": None,
-        "ollama_info": None
+        "llm_info": None
     }
 
     try:
-        from llm import check_ollama_health
-        health = check_ollama_health()
+        from llm import check_model_health
+        health = check_model_health()
 
         if health["healthy"]:
             analysis_status = {
                 "available": True,
                 "status": "healthy",
-                "ollama_info": {
-                    "url": health["url"],
+                "llm_info": {
                     "model": health["model"],
-                    "response_time": health["response_time"],
-                    "models_available": health.get("models_available", [])
+                    "device": health["device"],
+                    "response_time": health["response_time"]
                 }
             }
         else:
@@ -94,10 +93,9 @@ async def get_config():
                 "available": False,
                 "status": "unhealthy",
                 "error": health["error"],
-                "ollama_info": {
-                    "url": health["url"],
+                "llm_info": {
                     "model": health["model"],
-                    "models_available": health.get("models_available", [])
+                    "device": health["device"]
                 }
             }
 
@@ -403,42 +401,41 @@ async def start_analysis(request: AnalyzeRequest):
     if not request.results:
         raise HTTPException(status_code=400, detail="Results are required for analysis")
 
-    # Pre-flight check: Verify Ollama is available before starting analysis
+    # Pre-flight check: Verify LLM is available before starting analysis
     try:
-        from llm import check_ollama_health
-        health = check_ollama_health()
+        from llm import check_model_health
+        health = check_model_health()
 
         if not health["healthy"]:
-            # Ollama not available - return detailed error
+            # LLM not available - return detailed error
             error_details = {
                 "error": "Content analysis not available",
                 "reason": health["error"],
-                "ollama_config": {
-                    "url": health["url"],
+                "llm_config": {
                     "model": health["model"],
-                    "models_available": health.get("models_available", [])
+                    "device": health["device"]
                 },
                 "troubleshooting": []
             }
 
             # Add specific troubleshooting tips based on error type
-            if "Connection refused" in health["error"]:
+            if "load" in health["error"].lower() or "memory" in health["error"].lower():
                 error_details["troubleshooting"].extend([
-                    "Ollama server is not running",
-                    "Start Ollama with: 'ollama serve'",
-                    "Check if Ollama is installed: https://ollama.ai/"
+                    "Not enough memory to load the model",
+                    "Try using a smaller model",
+                    "Close other applications to free up memory"
                 ])
-            elif "not found" in health["error"] or "not available" in health["error"]:
+            elif "not found" in health["error"].lower() or "not available" in health["error"].lower():
                 error_details["troubleshooting"].extend([
-                    f"Model '{health['model']}' is not installed",
-                    f"Install model with: 'ollama pull {health['model']}'",
-                    f"Or use an available model: {', '.join(health.get('models_available', []))}"
+                    f"Model '{health['model']}' could not be loaded",
+                    "Check your internet connection for first-time model download",
+                    "Try a different model by setting HF_MODEL_ID environment variable"
                 ])
             elif "timeout" in health["error"].lower():
                 error_details["troubleshooting"].extend([
-                    "Ollama server is slow to respond",
-                    "Check system resources and network connectivity",
-                    "Try restarting Ollama service"
+                    "Model is slow to respond",
+                    "Check system resources",
+                    "Try using CPU instead of GPU by setting HF_DEVICE=cpu"
                 ])
 
             raise HTTPException(
@@ -446,7 +443,7 @@ async def start_analysis(request: AnalyzeRequest):
                 detail=error_details
             )
 
-        print(f"[API] Ollama health check passed: {health['url']} with {health['model']} ({health['response_time']}s)")
+        print(f"[API] LLM health check passed: {health['model']} on {health['device']} ({health['response_time']}s)")
 
     except ImportError:
         raise HTTPException(
@@ -469,7 +466,7 @@ async def start_analysis(request: AnalyzeRequest):
                 "reason": str(e),
                 "troubleshooting": [
                     "Check server logs for detailed error information",
-                    "Verify Ollama installation and configuration"
+                    "Verify HuggingFace model configuration"
                 ]
             }
         )
@@ -539,9 +536,8 @@ async def start_analysis(request: AnalyzeRequest):
                         if "health_check" in analysis_result:
                             health = analysis_result["health_check"]
                             error_details["health_info"] = {
-                                "ollama_url": health.get("url"),
-                                "ollama_model": health.get("model"),
-                                "models_available": health.get("models_available", []),
+                                "llm_model": health.get("model"),
+                                "llm_device": health.get("device"),
                                 "error": health.get("error")
                             }
 
