@@ -10,6 +10,7 @@ import os
 import sys
 import json
 from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # Add project root to path for proper imports in Celery context
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -556,55 +557,62 @@ def scrape_topic_task(self, topic: str, job_id: str, search_mode: str = "scrapin
             if search_mode == "api":
                 print("[Warning] API mode requested but not available. Falling back to scraping.")
 
-            # Step 2: Scrape Video & Code platforms (if selected)
-            if "youtube" in sources or "github" in sources:
-                self.update_state(
-                    state="PROGRESS",
-                    meta={"step": "Scraping Video & Code...", "progress": 30}
-                )
-                if "youtube" in sources:
-                    results["youtube"] = scrape_youtube(q.get("youtube_query", topic))
-                if "github" in sources:
-                    results["github"] = scrape_github_repos(q.get("github_query", topic))
+            # PARALLEL SCRAPING - All scrapers run simultaneously for speed
+            self.update_state(
+                state="PROGRESS",
+                meta={"step": "Scraping all sources in parallel...", "progress": 30}
+            )
 
-            # Step 3: Scrape Social platforms via search engine (if selected)
-            social_sources = [s for s in sources if s in ["linkedin", "facebook", "instagram"]]
-            if social_sources:
-                self.update_state(
-                    state="PROGRESS",
-                    meta={"step": "Scraping Socials via Search Engine...", "progress": 45}
-                )
-                if "linkedin" in sources:
-                    results["linkedin"] = scrape_linkedin(q.get("linkedin_query", f"{topic} linkedin"))
-                if "facebook" in sources:
-                    results["facebook"] = scrape_facebook(q.get("facebook_query", f"{topic} facebook groups"))
-                if "instagram" in sources:
-                    results["instagram"] = scrape_instagram(q.get("instagram_query", f"{topic} instagram"))
+            # Build scraper tasks dynamically based on selected sources
+            scraper_tasks = {}
+            if "youtube" in sources:
+                scraper_tasks["youtube"] = (scrape_youtube, q.get("youtube_query", topic))
+            if "github" in sources:
+                scraper_tasks["github"] = (scrape_github_repos, q.get("github_query", topic))
+            if "linkedin" in sources:
+                scraper_tasks["linkedin"] = (scrape_linkedin, q.get("linkedin_query", f"{topic} linkedin"))
+            if "facebook" in sources:
+                scraper_tasks["facebook"] = (scrape_facebook, q.get("facebook_query", f"{topic} facebook groups"))
+            if "instagram" in sources:
+                scraper_tasks["instagram"] = (scrape_instagram, q.get("instagram_query", f"{topic} instagram"))
+            if "twitter" in sources:
+                scraper_tasks["twitter"] = (scrape_twitter, q.get("twitter_query", f"{topic} expert tweets"))
+            if "quora" in sources:
+                scraper_tasks["quora"] = (scrape_quora, q.get("quora_query", f"{topic} questions answers"))
+            if "blogs" in sources:
+                scraper_tasks["blogs"] = (scrape_blog_articles, q.get("blog_query", f"{topic} tutorial blog"))
+            if "reddit" in sources:
+                scraper_tasks["reddit"] = (scrape_reddit_communities, q.get("reddit_query", topic))
+            if "events" in sources:
+                scraper_tasks["events"] = (scrape_eventbrite, q.get("events_query", f"{topic} workshop"))
 
-            # Step 4: Scrape Twitter/X and Quora (if selected)
-            if "twitter" in sources or "quora" in sources:
-                self.update_state(
-                    state="PROGRESS",
-                    meta={"step": "Scraping Twitter & Quora...", "progress": 60}
-                )
-                if "twitter" in sources:
-                    results["twitter"] = scrape_twitter(q.get("twitter_query", f"{topic} expert tweets"))
-                if "quora" in sources:
-                    results["quora"] = scrape_quora(q.get("quora_query", f"{topic} questions answers"))
+            # Execute all scrapers in parallel
+            print(f"[PARALLEL] Starting {len(scraper_tasks)} scrapers in parallel...")
+            with ThreadPoolExecutor(max_workers=10) as executor:
+                # Submit all scraper tasks
+                future_to_source = {
+                    executor.submit(func, query): source_name
+                    for source_name, (func, query) in scraper_tasks.items()
+                }
 
-            # Step 5: Scrape Forums, Blogs & Events (if selected)
-            content_sources = [s for s in sources if s in ["blogs", "reddit", "events"]]
-            if content_sources:
-                self.update_state(
-                    state="PROGRESS",
-                    meta={"step": "Scraping Blogs, Forums & Events...", "progress": 75}
-                )
-                if "blogs" in sources:
-                    results["blogs"] = scrape_blog_articles(q.get("blog_query", f"{topic} tutorial blog"))
-                if "reddit" in sources:
-                    results["reddit"] = scrape_reddit_communities(q.get("reddit_query", topic))
-                if "events" in sources:
-                    results["events"] = scrape_eventbrite(q.get("events_query", f"{topic} workshop"))
+                # Collect results as they complete
+                completed = 0
+                for future in as_completed(future_to_source):
+                    source_name = future_to_source[future]
+                    completed += 1
+                    try:
+                        results[source_name] = future.result(timeout=120)
+                        print(f"[PARALLEL] Completed {source_name} ({completed}/{len(scraper_tasks)})")
+                    except Exception as e:
+                        print(f"[PARALLEL] Error scraping {source_name}: {e}")
+                        results[source_name] = []
+
+                    # Update progress
+                    progress = 30 + int((completed / len(scraper_tasks)) * 50)
+                    self.update_state(
+                        state="PROGRESS",
+                        meta={"step": f"Scraped {completed}/{len(scraper_tasks)} sources...", "progress": progress}
+                    )
 
         # Step 6: Rank content using LLM
         self.update_state(

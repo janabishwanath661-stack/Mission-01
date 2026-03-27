@@ -40,9 +40,9 @@ OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.2:latest")
 MAX_CONTENT_LENGTH = 8000  # Characters for LLM analysis
 REQUEST_TIMEOUT = 15  # Seconds per webpage
 LLM_TIMEOUT = 60  # Seconds per analysis
-RATE_LIMIT_MIN = 1.0  # Minimum delay between requests
-RATE_LIMIT_MAX = 2.5  # Maximum delay between requests
-MAX_WORKERS = 3  # Parallel processing threads
+RATE_LIMIT_MIN = 0.3  # Minimum delay between requests (reduced for speed)
+RATE_LIMIT_MAX = 0.8  # Maximum delay between requests (reduced for speed)
+MAX_WORKERS = 8  # Parallel processing threads (increased from 3)
 
 
 class WebContentExtractor:
